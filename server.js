@@ -1,136 +1,82 @@
 const http = require('http');
 const https = require('https');
-const url = require('url');
 
 const PORT = process.env.PORT || 3000;
 
-function corsHeaders() {
+function cors() {
   return {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Headers': 'Content-Type',
     'Content-Type': 'application/json'
   };
 }
 
-function makeRequest(targetUrl, postData, extraHeaders = {}) {
+function post(targetUrl, data) {
   return new Promise((resolve, reject) => {
-    const parsed = new url.URL(targetUrl);
-    const isHttps = parsed.protocol === 'https:';
-    const lib = isHttps ? https : http;
-
-    const headers = {
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(postData),
-      ...extraHeaders
-    };
-
-    const options = {
-      hostname: parsed.hostname,
-      port: parsed.port || (isHttps ? 443 : 80),
-      path: parsed.pathname + parsed.search,
+    const u = new URL(targetUrl);
+    const lib = u.protocol === 'https:' ? https : http;
+    const body = JSON.stringify(data);
+    const req = lib.request({
+      hostname: u.hostname,
+      port: u.port || (u.protocol === 'https:' ? 443 : 80),
+      path: u.pathname,
       method: 'POST',
-      headers
-    };
-
-    const req = lib.request(options, res => {
-      let data = '';
-      const cookies = res.headers['set-cookie'] || [];
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => resolve({ data, cookies, status: res.statusCode }));
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+    }, res => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => resolve(JSON.parse(d)));
     });
-
     req.on('error', reject);
-    req.write(postData);
+    req.write(body);
     req.end();
   });
 }
 
 const server = http.createServer((req, res) => {
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204, corsHeaders());
-    res.end();
-    return;
-  }
+  if (req.method === 'OPTIONS') { res.writeHead(204, cors()); res.end(); return; }
+  if (req.method === 'GET') { res.writeHead(200, cors()); res.end(JSON.stringify({ ok: true })); return; }
 
-  if (req.method === 'GET') {
-    res.writeHead(200, corsHeaders());
-    res.end(JSON.stringify({ status: 'OdooAI Proxy v3 running' }));
-    return;
-  }
+  let body = '';
+  req.on('data', c => body += c);
+  req.on('end', async () => {
+    try {
+      const { odooUrl, db, apiKey, model, method, args, kwargs } = JSON.parse(body);
 
-  if (req.method === 'POST' && req.url === '/connect') {
-    // Step 1: Authenticate and return session cookie
-    let body = '';
-    req.on('data', chunk => body += chunk);
-    req.on('end', async () => {
-      try {
-        const { odooUrl, db, apiKey } = JSON.parse(body);
+      // Step 1: get uid using API key as password
+      const auth = await post(`${odooUrl}/xmlrpc/2/common`, {
+        jsonrpc: '2.0', method: 'call', id: 1,
+        params: { service: 'common', method: 'authenticate', args: [db, 'admin', apiKey, {}] }
+      });
 
-        // Odoo accepts API key as password with login "admin" or the user's login
-        // Try authenticating via /web/session/authenticate
-        const payload = JSON.stringify({
-          jsonrpc: '2.0', method: 'call', id: 1,
-          params: {
-            db,
-            login: 'admin',
-            password: apiKey
-          }
-        });
-
-        const result = await makeRequest(`${odooUrl}/web/session/authenticate`, payload);
-        const parsed = JSON.parse(result.data);
-
-        if (parsed.result && parsed.result.uid) {
-          // Extract session cookie
-          const sessionCookie = result.cookies.map(c => c.split(';')[0]).join('; ');
-          res.writeHead(200, corsHeaders());
-          res.end(JSON.stringify({
-            success: true,
-            uid: parsed.result.uid,
-            name: parsed.result.name,
-            sessionCookie
-          }));
-        } else {
-          res.writeHead(200, corsHeaders());
-          res.end(JSON.stringify({ success: false, error: 'Authentication failed. Check your API key and make sure it belongs to the admin user.' }));
-        }
-      } catch (e) {
-        res.writeHead(200, corsHeaders());
-        res.end(JSON.stringify({ success: false, error: e.message }));
+      const uid = auth.result;
+      if (!uid) {
+        res.writeHead(200, cors());
+        res.end(JSON.stringify({ error: 'Invalid API key or database. Check your Odoo API key.' }));
+        return;
       }
-    });
-    return;
-  }
 
-  if (req.method === 'POST' && req.url === '/proxy') {
-    let body = '';
-    req.on('data', chunk => body += chunk);
-    req.on('end', async () => {
-      try {
-        const { odooUrl, path: odooPath, payload, sessionCookie } = JSON.parse(body);
-
-        if (!odooUrl || !odooPath || !payload) {
-          res.writeHead(400, corsHeaders());
-          res.end(JSON.stringify({ error: 'Missing fields' }));
-          return;
-        }
-
-        const extraHeaders = sessionCookie ? { 'Cookie': sessionCookie } : {};
-        const result = await makeRequest(`${odooUrl}${odooPath}`, JSON.stringify(payload), extraHeaders);
-
-        res.writeHead(result.status, corsHeaders());
-        res.end(result.data);
-      } catch (e) {
-        res.writeHead(502, corsHeaders());
-        res.end(JSON.stringify({ error: e.message }));
+      // Step 2: if only auth needed, return uid
+      if (!model) {
+        res.writeHead(200, cors());
+        res.end(JSON.stringify({ uid, success: true }));
+        return;
       }
-    });
-    return;
-  }
 
-  res.writeHead(404, corsHeaders());
-  res.end(JSON.stringify({ error: 'Use POST /connect or POST /proxy' }));
+      // Step 3: call the requested model/method
+      const result = await post(`${odooUrl}/xmlrpc/2/object`, {
+        jsonrpc: '2.0', method: 'call', id: 2,
+        params: { service: 'object', method: 'execute_kw', args: [db, uid, apiKey, model, method, args || [], kwargs || {}] }
+      });
+
+      res.writeHead(200, cors());
+      res.end(JSON.stringify(result));
+    } catch (e) {
+      res.writeHead(200, cors());
+      res.end(JSON.stringify({ error: e.message }));
+    }
+  });
 });
 
-server.listen(PORT, () => console.log(`OdooAI Proxy v3 on port ${PORT}`));
+server.listen(PORT, () => console.log(`OdooAI Proxy running on port ${PORT}`));
