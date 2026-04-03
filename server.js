@@ -13,6 +13,39 @@ function corsHeaders() {
   };
 }
 
+function makeRequest(targetUrl, postData, extraHeaders = {}) {
+  return new Promise((resolve, reject) => {
+    const parsed = new url.URL(targetUrl);
+    const isHttps = parsed.protocol === 'https:';
+    const lib = isHttps ? https : http;
+
+    const headers = {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(postData),
+      ...extraHeaders
+    };
+
+    const options = {
+      hostname: parsed.hostname,
+      port: parsed.port || (isHttps ? 443 : 80),
+      path: parsed.pathname + parsed.search,
+      method: 'POST',
+      headers
+    };
+
+    const req = lib.request(options, res => {
+      let data = '';
+      const cookies = res.headers['set-cookie'] || [];
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => resolve({ data, cookies, status: res.statusCode }));
+    });
+
+    req.on('error', reject);
+    req.write(postData);
+    req.end();
+  });
+}
+
 const server = http.createServer((req, res) => {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, corsHeaders());
@@ -22,83 +55,82 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'GET') {
     res.writeHead(200, corsHeaders());
-    res.end(JSON.stringify({ status: 'OdooAI Proxy running', version: '2.0' }));
+    res.end(JSON.stringify({ status: 'OdooAI Proxy v3 running' }));
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/connect') {
+    // Step 1: Authenticate and return session cookie
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', async () => {
+      try {
+        const { odooUrl, db, apiKey } = JSON.parse(body);
+
+        // Odoo accepts API key as password with login "admin" or the user's login
+        // Try authenticating via /web/session/authenticate
+        const payload = JSON.stringify({
+          jsonrpc: '2.0', method: 'call', id: 1,
+          params: {
+            db,
+            login: 'admin',
+            password: apiKey
+          }
+        });
+
+        const result = await makeRequest(`${odooUrl}/web/session/authenticate`, payload);
+        const parsed = JSON.parse(result.data);
+
+        if (parsed.result && parsed.result.uid) {
+          // Extract session cookie
+          const sessionCookie = result.cookies.map(c => c.split(';')[0]).join('; ');
+          res.writeHead(200, corsHeaders());
+          res.end(JSON.stringify({
+            success: true,
+            uid: parsed.result.uid,
+            name: parsed.result.name,
+            sessionCookie
+          }));
+        } else {
+          res.writeHead(200, corsHeaders());
+          res.end(JSON.stringify({ success: false, error: 'Authentication failed. Check your API key and make sure it belongs to the admin user.' }));
+        }
+      } catch (e) {
+        res.writeHead(200, corsHeaders());
+        res.end(JSON.stringify({ success: false, error: e.message }));
+      }
+    });
     return;
   }
 
   if (req.method === 'POST' && req.url === '/proxy') {
     let body = '';
     req.on('data', chunk => body += chunk);
-    req.on('end', () => {
-      let parsed;
-      try { parsed = JSON.parse(body); }
-      catch (e) {
-        res.writeHead(400, corsHeaders());
-        res.end(JSON.stringify({ error: 'Invalid JSON' }));
-        return;
-      }
+    req.on('end', async () => {
+      try {
+        const { odooUrl, path: odooPath, payload, sessionCookie } = JSON.parse(body);
 
-      const { odooUrl, path: odooPath, payload, apiKey } = parsed;
+        if (!odooUrl || !odooPath || !payload) {
+          res.writeHead(400, corsHeaders());
+          res.end(JSON.stringify({ error: 'Missing fields' }));
+          return;
+        }
 
-      if (!odooUrl || !odooPath || !payload) {
-        res.writeHead(400, corsHeaders());
-        res.end(JSON.stringify({ error: 'Missing odooUrl, path, or payload' }));
-        return;
-      }
+        const extraHeaders = sessionCookie ? { 'Cookie': sessionCookie } : {};
+        const result = await makeRequest(`${odooUrl}${odooPath}`, JSON.stringify(payload), extraHeaders);
 
-      let parsedUrl;
-      try { parsedUrl = new url.URL(odooUrl + odooPath); }
-      catch (e) {
-        res.writeHead(400, corsHeaders());
-        res.end(JSON.stringify({ error: 'Invalid Odoo URL' }));
-        return;
-      }
-
-      const postData = JSON.stringify(payload);
-      const isHttps = parsedUrl.protocol === 'https:';
-      const lib = isHttps ? https : http;
-
-      const headers = {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(postData)
-      };
-
-      // Add API key auth header if provided
-      if (apiKey) {
-        const encoded = Buffer.from(`admin:${apiKey}`).toString('base64');
-        headers['Authorization'] = `Basic ${encoded}`;
-      }
-
-      const options = {
-        hostname: parsedUrl.hostname,
-        port: parsedUrl.port || (isHttps ? 443 : 80),
-        path: parsedUrl.pathname + parsedUrl.search,
-        method: 'POST',
-        headers
-      };
-
-      const proxyReq = lib.request(options, proxyRes => {
-        let data = '';
-        proxyRes.on('data', chunk => data += chunk);
-        proxyRes.on('end', () => {
-          res.writeHead(proxyRes.statusCode, corsHeaders());
-          res.end(data);
-        });
-      });
-
-      proxyReq.on('error', e => {
+        res.writeHead(result.status, corsHeaders());
+        res.end(result.data);
+      } catch (e) {
         res.writeHead(502, corsHeaders());
-        res.end(JSON.stringify({ error: 'Proxy error: ' + e.message }));
-      });
-
-      proxyReq.write(postData);
-      proxyReq.end();
+        res.end(JSON.stringify({ error: e.message }));
+      }
     });
     return;
   }
 
   res.writeHead(404, corsHeaders());
-  res.end(JSON.stringify({ error: 'Use POST /proxy' }));
+  res.end(JSON.stringify({ error: 'Use POST /connect or POST /proxy' }));
 });
 
-server.listen(PORT, () => console.log(`OdooAI Proxy v2 running on port ${PORT}`));
+server.listen(PORT, () => console.log(`OdooAI Proxy v3 on port ${PORT}`));
