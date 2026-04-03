@@ -14,35 +14,31 @@ function corsHeaders() {
 }
 
 const server = http.createServer((req, res) => {
-  // Handle preflight
   if (req.method === 'OPTIONS') {
     res.writeHead(204, corsHeaders());
     res.end();
     return;
   }
 
-  // Health check
-  if (req.path === '/' || req.url === '/') {
+  if (req.method === 'GET') {
     res.writeHead(200, corsHeaders());
-    res.end(JSON.stringify({ status: 'OdooAI Proxy running' }));
+    res.end(JSON.stringify({ status: 'OdooAI Proxy running', version: '2.0' }));
     return;
   }
 
-  // Only allow /proxy endpoint
   if (req.method === 'POST' && req.url === '/proxy') {
     let body = '';
     req.on('data', chunk => body += chunk);
     req.on('end', () => {
       let parsed;
-      try {
-        parsed = JSON.parse(body);
-      } catch (e) {
+      try { parsed = JSON.parse(body); }
+      catch (e) {
         res.writeHead(400, corsHeaders());
-        res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+        res.end(JSON.stringify({ error: 'Invalid JSON' }));
         return;
       }
 
-      const { odooUrl, path: odooPath, payload } = parsed;
+      const { odooUrl, path: odooPath, payload, apiKey } = parsed;
 
       if (!odooUrl || !odooPath || !payload) {
         res.writeHead(400, corsHeaders());
@@ -50,13 +46,11 @@ const server = http.createServer((req, res) => {
         return;
       }
 
-      // Parse the Odoo URL
       let parsedUrl;
-      try {
-        parsedUrl = new url.URL(odooUrl + odooPath);
-      } catch (e) {
+      try { parsedUrl = new url.URL(odooUrl + odooPath); }
+      catch (e) {
         res.writeHead(400, corsHeaders());
-        res.end(JSON.stringify({ error: 'Invalid Odoo URL: ' + odooUrl }));
+        res.end(JSON.stringify({ error: 'Invalid Odoo URL' }));
         return;
       }
 
@@ -64,15 +58,23 @@ const server = http.createServer((req, res) => {
       const isHttps = parsedUrl.protocol === 'https:';
       const lib = isHttps ? https : http;
 
+      const headers = {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(postData)
+      };
+
+      // Add API key auth header if provided
+      if (apiKey) {
+        const encoded = Buffer.from(`admin:${apiKey}`).toString('base64');
+        headers['Authorization'] = `Basic ${encoded}`;
+      }
+
       const options = {
         hostname: parsedUrl.hostname,
         port: parsedUrl.port || (isHttps ? 443 : 80),
         path: parsedUrl.pathname + parsedUrl.search,
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(postData)
-        }
+        headers
       };
 
       const proxyReq = lib.request(options, proxyRes => {
@@ -96,9 +98,7 @@ const server = http.createServer((req, res) => {
   }
 
   res.writeHead(404, corsHeaders());
-  res.end(JSON.stringify({ error: 'Not found. Use POST /proxy' }));
+  res.end(JSON.stringify({ error: 'Use POST /proxy' }));
 });
 
-server.listen(PORT, () => {
-  console.log(`OdooAI Proxy running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`OdooAI Proxy v2 running on port ${PORT}`));
